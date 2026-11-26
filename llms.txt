@@ -1,0 +1,539 @@
+# Aura Pagamentos — API Documentation (v1.2)
+
+API REST para cobranças PIX e pagamentos com cartão de crédito no Brasil. Valores em reais no request, autenticação via header `x-api-key`.
+
+## URL Base
+
+```
+https://flhazmznqlqdlqgrpqdz.supabase.co/functions/v1
+```
+
+## Autenticação
+
+Todas as requisições autenticadas exigem o header:
+
+```
+x-api-key: ak_live_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+```
+
+- A API Key começa com `ak_` e é gerada no painel do seller em **API & Webhooks**.
+- **Nunca** exponha a API Key no front-end. Ela deve ser usada apenas em servidores backend.
+- Cada seller possui suas próprias chaves e escopo de dados.
+
+Erros de autenticação:
+- `401 Unauthorized` — API Key ausente ou inválida.
+- `403 Forbidden` — API Key desativada ou seller inativo.
+
+---
+
+## POST /public-api-create-transaction — Criar Cobrança PIX
+
+Cria uma cobrança PIX e retorna o QR Code (imagem base64) e o payload copia-e-cola (BRCode/EMV).
+
+### Endpoint
+
+```
+POST https://flhazmznqlqdlqgrpqdz.supabase.co/functions/v1/public-api-create-transaction
+Content-Type: application/json
+x-api-key: ak_live_...
+```
+
+### Parâmetros
+
+| Campo | Tipo | Obrigatório | Descrição |
+|---|---|---|---|
+| `amount` | number | sim | Valor em **reais** (ex.: `49.90`). Mínimo geral R$ 1,00 — algumas adquirentes exigem R$ 5,00. |
+| `payment_method` | string | não | `pix` (default) ou `credit_card`. |
+| `description` | string | não | Descrição da cobrança (livre). |
+| `expires_in_hours` | number | não | Expiração customizada em horas. Default global: 30 minutos. |
+| `external_ref` | string | não | Referência externa do pedido no sistema do seller. |
+| `webhook_url` | string | não | URL de webhook específica para esta transação (sobrescreve o webhook global do painel). |
+| `metadata` | object | não | Objeto JSON livre para armazenar dados adicionais. |
+| `customer.name` | string | sim | Nome do pagador. |
+| `customer.document` | string | sim | CPF ou CNPJ (somente números). |
+| `customer.document_type` | string | **sim** | `"CPF"` ou `"CNPJ"` (**maiúsculo**). Backend valida estritamente — omitir ou usar minúsculo retorna 400. |
+| `customer.email` | string | sim | E-mail do pagador. |
+| `customer.phone` | string | não | Telefone com DDD. |
+| `customer.ip` | string | não | IP real do comprador (**obrigatório para tracking UTMify**). |
+| `customer.address` | object | não | Endereço completo (`street`, `number`, `complement`, `neighborhood`, `city`, `state`, `zip_code`). |
+| `tracking` | object | não | Parâmetros de origem: `utm_source`, `utm_medium`, `utm_campaign`, `utm_term`, `utm_content`, `src`, `sck`. Encaminhados para a UTMify. |
+
+### Exemplo de Request (PIX)
+
+```json
+{
+  "amount": 49.90,
+  "payment_method": "pix",
+  "description": "Pedido #1234",
+  "external_ref": "order_1234",
+  "expires_in_hours": 1,
+  "webhook_url": "https://minha-loja.com/webhooks/aura-pagamentos",
+  "customer": {
+    "name": "João Silva",
+    "document": "12345678900",
+    "document_type": "CPF",
+    "email": "joao@example.com",
+    "phone": "11999998888",
+    "ip": "200.201.202.203",
+    "address": {
+      "street": "Rua Exemplo",
+      "number": "123",
+      "neighborhood": "Centro",
+      "city": "São Paulo",
+      "state": "SP",
+      "zip_code": "01000000"
+    }
+  },
+  "tracking": {
+    "utm_source": "facebook",
+    "utm_medium": "cpc",
+    "utm_campaign": "black_friday",
+    "src": "fb_ads",
+    "sck": "abc123"
+  },
+  "metadata": { "produto_id": "sku-789" }
+}
+```
+
+### Resposta 201 (PIX)
+
+```json
+{
+  "id": "b3f1a2c4-...",
+  "external_ref": "order_1234",
+  "amount": 49.90,
+  "fee": 3.49,
+  "net_amount": 46.41,
+  "status": "waiting_payment",
+  "payment_method": "pix",
+  "pix": {
+    "copy_paste_code": "00020126580014br.gov.bcb.pix...",
+    "qr_code_url": "https://.../qr.png",
+    "expires_at": "2026-07-21T18:00:00Z"
+  },
+  "customer": {
+    "name": "João Silva",
+    "document": "***.456.789-**"
+  },
+  "created_at": "2026-07-21T17:30:00Z"
+}
+```
+
+### Erros comuns
+
+- `400 Bad Request` — `amount inválido`, `customer.document inválido`, `Valor mínimo para esta adquirente é R$ 5,00`.
+- `401 Unauthorized` — API Key ausente/inválida.
+- `403 Forbidden` — Seller inativo ou sem permissão para o método.
+
+---
+
+## POST /public-api-create-transaction — Pagamento com Cartão
+
+Mesma URL do PIX, com `payment_method: "credit_card"` e objeto `card`. Requer **tokenização client-side via ShieldHelper** (PCI-DSS) — o número do cartão **nunca** trafega pelo backend do seller.
+
+### Fluxo ShieldHelper (front-end)
+
+1. Incluir o script no checkout:
+
+```html
+<script src="https://api.paysharkgateway.com.br/v1/js"></script>
+```
+
+2. Inicializar o helper e preparar o 3DS **antes** de criar a transação:
+
+```javascript
+const PUBLIC_KEY = 'pk_j8iPqjurYkTDxHjXsJqAQnhvmU-Ar9AnrBU8GcPYWfdO4I9R';
+
+// Handle dinâmico do módulo (WiteTec/PayShark)
+const moduleName = ShieldHelper.getModuleName();
+const shield = window[moduleName];
+await shield.setPublicKey(PUBLIC_KEY);
+
+// Prepara o 3DS — retorna { cavv, xid, eci, version, referenceId }
+const threeDS = await ShieldHelper.prepareThreeDS({
+  amount: 12990,        // em centavos
+  installments: 3,
+  currency: 'BRL'
+});
+
+// Tokeniza o cartão (o número NÃO trafega pelo seu backend)
+const token = await shield.encrypt({
+  number: '4111111111111111',
+  holderName: 'JOAO SILVA',
+  expMonth: 12,
+  expYear: 2030,
+  cvv: '123'
+});
+```
+
+3. Enviar ao seu backend `{ token, threeDS, installments, ... }` e chamar a API Aura Pagamentos (`x-api-key`) passando `card.token` e `card.three_ds` (com `cavv`, `xid`, `eci`, `version`, `reference_id`).
+
+4. Ao receber a resposta, finalizar o 3DS no navegador do comprador:
+
+```javascript
+// A resposta da Aura Pagamentos inclui { ..., provider_response }
+const response = await createTransaction(...);
+await ShieldHelper.finishThreeDS(response.provider_response);
+```
+
+> **NUNCA persista ou logue `provider_response`** — contém dados sensíveis da adquirente.
+
+### Parâmetros de cartão
+
+| Campo | Tipo | Obrigatório | Descrição |
+|---|---|---|---|
+| `payment_method` | string | sim | `"credit_card"` |
+| `amount` | number | sim | Valor em reais. |
+| `card.token` | string | sim | Token gerado pelo `shield.encrypt`. |
+| `card.holder_name` | string | sim | Nome impresso no cartão. |
+| `card.holder_document` | string | sim | CPF/CNPJ do titular (somente números). |
+| `card.expiration_month` | number | sim | Mês (1–12). |
+| `card.expiration_year` | number | sim | Ano com **4 dígitos** (ex.: `2030`). A API converte internamente. |
+| `card.cvv` | string | não | Código de segurança (recomendado). |
+| `card.installments` | number | não | Parcelas (default `1`, máx. 12). |
+| `card.ip` | string | sim | IP do comprador. |
+| `card.three_ds` | object | não* | Objeto do `prepareThreeDS` (`cavv`, `xid`, `eci`, `version`, `reference_id`). *Recomendado — sem 3DS a autorização pode ser recusada. |
+| `card.number` | string | não | Enviar apenas se a adquirente exigir número em claro além do token. |
+| `customer.*` | — | sim | Mesmos campos do fluxo PIX (inclui `document_type` em MAIÚSCULO). |
+| `address_zip_code` | string | não* | CEP do comprador (somente números). |
+| `address_street` | string | não* | Rua/avenida. |
+| `address_number` | string | não* | Número. |
+| `address_neighborhood` | string | não* | Bairro. |
+| `address_city` | string | não* | Cidade. |
+| `address_state` | string | não* | UF (2 letras). |
+| `address_complement` | string | não | Complemento. |
+
+*Endereço do comprador: opcional para a maioria das adquirentes, **obrigatório** para adquirentes que exigem endereço de cobrança. Se faltar algum campo obrigatório, a API responde `400` listando exatamente os campos ausentes, sem criar cobrança. Os campos podem ser enviados no nível raiz do body ou dentro de um objeto `address`.
+
+### Resposta `requires_action` (3DS concluído no seu checkout)
+
+Quando a adquirente exige autenticação 3DS no navegador, a API responde `201` com `status: "requires_action"`. A transação fica **pendente** — a confirmação financeira chega depois pelo webhook.
+
+```json
+{
+  "id": "b3f1a2c4-...",
+  "external_ref": "meu-pedido-1",
+  "amount": 100.00,
+  "fee": 6.49,
+  "net_amount": 93.51,
+  "status": "requires_action",
+  "payment_method": "credit_card",
+  "payment_intent_id": "pi_...",
+  "public_key": "pk_live_...",
+  "action": {
+    "type": "three_ds",
+    "transaction_id": "...",
+    "session": "...",
+    "three_ds_session_id": "...",
+    "is_sandbox": false
+  },
+  "card": { "brand": "visa", "last4": "1111", "installments": 1 },
+  "created_at": "2026-01-01T12:00:00.000Z"
+}
+```
+
+`action.session` é sensível: use apenas no navegador para concluir o 3DS e **nunca** armazene nem registre em log.
+
+Já a resposta `status: "processing"` (análise antifraude) traz `status_reason` e `analysis_deadline_at`; aguarde o webhook.
+
+
+### Resposta 201 (Cartão)
+
+```json
+{
+  "id": "b3f1a2c4-...",
+  "status": "paid",
+  "amount": 129.90,
+  "fee": 0,
+  "net_amount": 129.90,
+  "payment_method": "credit_card",
+  "installments": 3,
+  "provider_response": {
+    "id": "witetec_tx_id",
+    "status": "PAID",
+    "threeDS": { "...": "..." }
+  },
+  "external_ref": "order_9876",
+  "created_at": "2026-07-21T17:30:00Z"
+}
+```
+
+> `fee = 0` e `net_amount = amount` porque a taxa de cartão é aplicada no **recebível**, não na transação. Ver "Fluxo Financeiro do Cartão".
+
+### Status de resposta (cartão)
+
+| Status | Descrição |
+|---|---|
+| `paid` | Aprovado e capturado. |
+| `waiting_payment` | Autorização pendente (raro em cartão). |
+| `failed` | Recusado/falhou — exibir erro ao comprador; **não** repetir automaticamente. |
+
+---
+
+## Fluxo Financeiro do Cartão
+
+Vendas de cartão **NÃO** creditam o saldo disponível diretamente. O fluxo é:
+
+1. **Venda aprovada** → desconta a **taxa de transação por parcela** → o líquido vira **recebível** com status "Aguardando Liberação".
+2. **Após 2 dias úteis** → recebível fica **"Disponível para Antecipar"**.
+3. **Antecipação** solicitada pelo seller no painel, com **taxa de 3,99%**, sujeita à **aprovação do administrador**.
+4. Na aprovação, uma **reserva financeira** (percentual definido por seller, ex.: 20%) é retida sobre o líquido por **90 dias** e liberada automaticamente ao saldo depois.
+5. **Chargebacks** debitam do saldo disponível — o saldo pode **ficar negativo**.
+
+### Exemplo numérico
+
+- Recebível líquido disponível: **R$ 314,00**
+- Taxa de antecipação 3,99% → **R$ 12,53**
+- Líquido pós-antecipação: **R$ 301,47**
+- Reserva 20% (retida 90 dias): **R$ 60,29**
+- **Creditado no saldo: R$ 241,18**
+- Após 90 dias, os R$ 60,29 da reserva são liberados automaticamente.
+
+---
+
+## 3DS PagSeguro (Cartão)
+
+Sellers cuja adquirente de cartão opera com autenticação **3DS PagSeguro** podem receber uma exigência de autenticação por transação. O 3DS é **condicional**: a análise antifraude decide caso a caso.
+
+Após criar a transação de cartão, verifique `provider_response.threeDSecure` na resposta:
+
+- Se `required === true` → o fluxo abaixo é **obrigatório** para o pagamento completar.
+- Se ausente ou `false` → siga o fluxo normal, sem 3DS.
+
+> **NUNCA** persista ou logue `provider_response`. Ele contém dados sensíveis da adquirente e deve ser usado apenas em memória, no navegador do comprador.
+
+### Pré-requisitos
+
+- SDK PagSeguro carregado no HTML do checkout:
+  - Sandbox: `https://sandbox.pagseguro.uol.com.br/checkout-sdk-js/rc/dist/browser/pagseguro.min.js`
+  - Produção: `https://assets.pagseguro.com.br/checkout-sdk-js/rc/dist/browser/pagseguro.min.js`
+- Dados do comprador com **endereço de cobrança completo** (obrigatório para o 3DS).
+- **Telefone do comprador** na criação da transação (obrigatório para esta adquirente).
+- Valor mínimo **R$ 10,00**.
+
+### Fluxo completo
+
+1. **Criar a transação de cartão** normalmente (POST `/create-card-transaction` com `x-api-key: ak_...`, ou API pública com `payment_method: "credit_card"`). Inclua `customer_phone`.
+2. **Ler a resposta**: se `provider_response.threeDSecure.required === true`, guarde `threeDSecure.session` e `threeDSecure.transactionId` — este último será o `provider_transaction_id` da confirmação.
+3. **Inicializar o SDK** no front:
+   ```javascript
+   PagSeguro.setUp({ session: threeDSecure.session, env: 'PROD' }); // ou 'SANDBOX'
+   ```
+4. **Executar** `authenticate3DS` com o objeto `data`:
+   ```javascript
+   const noAccents = (s) => s.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+
+   const authResult = await PagSeguro.authenticate3DS({
+     data: {
+       customer: {
+         name: noAccents('João da Silva'),
+         email: 'joao@example.com',
+         phones: [{
+           country: '55',
+           area: 11,          // inteiro, sem formatação
+           number: 999998888, // inteiro, sem formatação
+           type: 'MOBILE'
+         }]
+       },
+       paymentMethod: {
+         type: 'CREDIT_CARD',
+         installments: 1,
+         card: {
+           number: '4111111111111111',   // só dígitos
+           expMonth: '12',
+           expYear: '2030',
+           holder: { name: noAccents('JOAO DA SILVA').toUpperCase() }
+         }
+       },
+       amount: { value: 12990, currency: 'BRL' }, // CENTAVOS
+       billingAddress: {
+         street: noAccents('Avenida Paulista'),
+         number: '1000',
+         complement: 'N/A',    // NUNCA vazio
+         regionCode: 'SP',
+         country: 'BRA',       // ISO 3 letras
+         city: noAccents('Sao Paulo'),
+         postalCode: '01310100' // só dígitos
+       },
+       shippingAddress: {      // OBRIGATÓRIO — pode replicar o billing
+         street: noAccents('Avenida Paulista'),
+         number: '1000',
+         complement: 'N/A',
+         regionCode: 'SP',
+         country: 'BRA',
+         city: noAccents('Sao Paulo'),
+         postalCode: '01310100'
+       },
+       dataOnly: false
+     }
+   });
+   ```
+5. **Challenge do emissor**: o modal/challenge do banco aparece para o comprador quando o emissor exigir. O SDK gerencia o retorno.
+6. **Validar o resultado**: prossiga somente se `authResult.status === 'AUTH_FLOW_COMPLETED'` **E** `authResult.authenticationStatus === 'AUTHENTICATED'`.
+7. **Confirmar no backend da Aura**:
+   ```javascript
+   await fetch('https://flhazmznqlqdlqgrpqdz.supabase.co/functions/v1/abcron-3ds', {
+     method: 'POST',
+     headers: {
+       'Content-Type': 'application/json',
+       'x-api-key': 'ak_live_...'
+     },
+     body: JSON.stringify({
+       action: 'confirm',
+       provider_transaction_id: threeDSecure.transactionId, // do passo 2
+       id: authResult.id,
+       status: authResult.status,
+       authenticationStatus: authResult.authenticationStatus,
+       transaction_id: '<id da transação na Aura>' // opcional, recomendado
+     })
+   });
+   ```
+8. **Confirmação final**: a confirmação do pagamento chega pelo webhook do seller (`transaction.paid`) ou consulta da transação. **Libere o pedido apenas nesse momento.**
+
+### Status da autenticação (SDK)
+
+| status | authenticationStatus | Ação |
+|---|---|---|
+| `AUTH_FLOW_COMPLETED` | `AUTHENTICATED` | Confirmar via endpoint (passo 7) |
+| `AUTH_FLOW_COMPLETED` | `NOT_AUTHENTICATED` | Falha na autenticação — informar erro ao comprador |
+| `AUTH_NOT_SUPPORTED` | — | Cartão não suporta 3DS — solicitar outro cartão |
+| `CHANGE_PAYMENT_METHOD` | — | Solicitar outro método de pagamento |
+
+### Regras de formato do SDK PagSeguro
+
+| Campo | Regra |
+|---|---|
+| `customer.name` | Sem acentos (normalize NFD + remover diacríticos) |
+| `customer.phones[].area` / `number` | Número **inteiro**, sem formatação |
+| `paymentMethod.card.number` | Apenas dígitos |
+| `paymentMethod.card.holder.name` | MAIÚSCULAS, sem acentos |
+| `billingAddress.complement` | Nunca vazio — usar `"N/A"` quando não houver |
+| `billingAddress.postalCode` | Apenas dígitos |
+| `billingAddress.street` / `city` | Sem acentos |
+| `billingAddress.country` | `"BRA"` (ISO 3 letras) |
+| `shippingAddress` | Obrigatório — pode replicar `billingAddress` |
+| `dataOnly` | `false` |
+| `amount.value` | Em **centavos** (inteiro) |
+
+### Erros comuns
+
+| Sintoma | Causa / Correção |
+|---|---|
+| Resposta sem `threeDSecure` | Transação não exige 3DS — seguir fluxo normal |
+| `400 provider_transaction_id é obrigatório` | Não guardou o `threeDSecure.transactionId` da criação |
+| `400 customer_phone é obrigatório` | Enviar telefone do comprador no payload de criação |
+| Token/session expirado | Recriar a transação para obter uma nova `session` |
+
+---
+
+
+
+## GET /public-api-get-transaction — Consultar Transação
+
+```
+GET https://flhazmznqlqdlqgrpqdz.supabase.co/functions/v1/public-api-get-transaction?id={transaction_id}
+x-api-key: ak_live_...
+```
+
+Retorna o mesmo objeto da criação, com o status atualizado.
+
+### Status possíveis
+
+| Status | Descrição |
+|---|---|
+| `waiting_payment` | Aguardando pagamento (PIX gerado ou cartão em análise). |
+| `paid` | Pago e confirmado. |
+| `expired` | Expirou sem pagamento (PIX). Estado terminal. |
+| `refunded` | Estornado. Estado terminal. |
+| `failed` | Pagamento com cartão recusado/falhou. Estado terminal. |
+| `chargedback` | Chargeback de cartão recebido. Estado terminal. |
+
+---
+
+## Webhooks
+
+Duas formas de receber notificações em tempo real:
+
+1. **Webhook global (painel)**: configurado em **API & Webhooks** com um `secret` para assinatura HMAC-SHA256. Vale para todas as transações do seller.
+2. **Webhook por transação**: passe `webhook_url` no body de criação — sobrescreve o global apenas para aquela transação. **Não** é assinado por HMAC do painel.
+
+### Headers enviados
+
+```
+x-auraflow-signature: sha256=<hex>
+x-auraflow-event: transaction.paid
+X-AuraFlow-Transaction-ID: <id>
+Content-Type: application/json
+```
+
+> Por compatibilidade, os headers técnicos mantêm o prefixo histórico `x-auraflow-*`.
+
+### Eventos
+
+| Evento | Quando dispara |
+|---|---|
+| `transaction.paid` | Pagamento confirmado (PIX ou cartão). |
+| `transaction.expired` | PIX expirou. |
+| `transaction.refunded` | Transação estornada. |
+| `transaction.chargedback` | Chargeback recebido (cartão). |
+
+### Payload de exemplo (`transaction.paid`)
+
+```json
+{
+  "event": "transaction.paid",
+  "transaction": {
+    "id": "b3f1a2c4-...",
+    "status": "paid",
+    "amount": 49.90,
+    "fee": 3.49,
+    "net_amount": 46.41,
+    "payment_method": "pix",
+    "external_ref": "order_1234",
+    "paid_at": "2026-07-21T17:35:00Z",
+    "customer": { "name": "João Silva", "email": "joao@example.com" },
+    "metadata": { "produto_id": "sku-789" }
+  }
+}
+```
+
+Payloads de `transaction.expired`, `transaction.refunded` e `transaction.chargedback` seguem o mesmo formato, com o `status` correspondente.
+
+### Validação de assinatura (pseudocódigo)
+
+```javascript
+import crypto from 'crypto';
+
+function verify(rawBody, header, secret) {
+  const expected = 'sha256=' + crypto
+    .createHmac('sha256', secret)
+    .update(rawBody)
+    .digest('hex');
+  return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(header));
+}
+```
+
+Use o **corpo cru** (não o JSON re-serializado) para o HMAC.
+
+### Recomendações
+
+- **Idempotência**: trate reentregas usando o `id` da transação.
+- Responda **HTTP 200** rapidamente; em caso de falha a entrega pode ser retentada — implemente **idempotência** usando o `id` da transação.
+- **Antes de liberar o pedido**, confirme o status via `GET /public-api-get-transaction`.
+
+---
+
+## Erros e Rate Limiting
+
+| HTTP | Significado |
+|---|---|
+| 400 | Payload inválido (inclui `Valor mínimo para esta adquirente é R$ 5,00`). |
+| 401 | API Key inválida/ausente. |
+| 403 | Seller/API Key sem permissão. |
+| 404 | Transação não encontrada. |
+| 429 | Rate limit — a API pode aplicar limitação; use **backoff exponencial**. |
+| 5xx | Erro interno — tentar novamente. |
+
+---
+
+v1.2 — 24/07/2026
